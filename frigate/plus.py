@@ -37,10 +37,14 @@ class PlusApi:
         self.key = None
         if PLUS_ENV_VAR in os.environ:
             self.key = os.environ.get(PLUS_ENV_VAR)
-        elif os.path.isdir("/run/secrets") and PLUS_ENV_VAR in os.listdir(
-            "/run/secrets"
+        elif (
+            os.path.isdir("/run/secrets")
+            and os.access("/run/secrets", os.R_OK)
+            and PLUS_ENV_VAR in os.listdir("/run/secrets")
         ):
-            self.key = Path(os.path.join("/run/secrets", PLUS_ENV_VAR)).read_text()
+            self.key = (
+                Path(os.path.join("/run/secrets", PLUS_ENV_VAR)).read_text().strip()
+            )
         # check for the addon options file
         elif os.path.isfile("/data/options.json"):
             with open("/data/options.json") as f:
@@ -64,11 +68,13 @@ class PlusApi:
             or self._token_data["expires"] - datetime.datetime.now().timestamp() < 60
         ):
             if self.key is None:
-                raise Exception("Plus API not activated")
+                raise Exception(
+                    "Plus API key not set. See https://docs.frigate.video/integrations/plus#set-your-api-key"
+                )
             parts = self.key.split(":")
             r = requests.get(f"{self.host}/v1/auth/token", auth=(parts[0], parts[1]))
             if not r.ok:
-                raise Exception("Unable to refresh API token")
+                raise Exception(f"Unable to refresh API token: {r.text}")
             self._token_data = r.json()
 
     def _get_authorization_header(self) -> dict:
@@ -110,15 +116,6 @@ class PlusApi:
         r = requests.post(presigned_urls["original"]["url"], files=files, data=data)
         if not r.ok:
             logger.error(f"Failed to upload original: {r.status_code} {r.text}")
-            raise Exception(r.text)
-
-        # resize and submit annotate
-        files = {"file": get_jpg_bytes(image, 640, 70)}
-        data = presigned_urls["annotate"]["fields"]
-        data["content-type"] = "image/jpeg"
-        r = requests.post(presigned_urls["annotate"]["url"], files=files, data=data)
-        if not r.ok:
-            logger.error(f"Failed to upload annotate: {r.status_code} {r.text}")
             raise Exception(r.text)
 
         # resize and submit thumbnail
@@ -171,6 +168,17 @@ class PlusApi:
         )
 
         if not r.ok:
+            try:
+                error_response = r.json()
+                errors = error_response.get("errors", [])
+                for error in errors:
+                    if (
+                        error.get("param") == "label"
+                        and error.get("type") == "invalid_enum_value"
+                    ):
+                        raise ValueError(f"Unsupported label value provided: {label}")
+            except ValueError as e:
+                raise e
             raise Exception(r.text)
 
     def add_annotation(
@@ -193,6 +201,17 @@ class PlusApi:
         )
 
         if not r.ok:
+            try:
+                error_response = r.json()
+                errors = error_response.get("errors", [])
+                for error in errors:
+                    if (
+                        error.get("param") == "label"
+                        and error.get("type") == "invalid_enum_value"
+                    ):
+                        raise ValueError(f"Unsupported label value provided: {label}")
+            except ValueError as e:
+                raise e
             raise Exception(r.text)
 
     def get_model_download_url(
