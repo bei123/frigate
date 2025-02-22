@@ -4,7 +4,9 @@ title: Advanced Options
 sidebar_label: Advanced Options
 ---
 
-### `logger`
+### Logging
+
+#### Frigate `logger`
 
 Change the default log level for troubleshooting purposes.
 
@@ -28,6 +30,18 @@ Examples of available modules are:
 - `watchdog.<camera_name>`
 - `ffmpeg.<camera_name>.<sorted_roles>` NOTE: All FFmpeg logs are sent as `error` level.
 
+#### Go2RTC Logging
+
+See [the go2rtc docs](https://github.com/AlexxIT/go2rtc?tab=readme-ov-file#module-log) for logging configuration
+
+```yaml
+go2rtc:
+  streams:
+    # ...
+  log:
+    exec: trace
+```
+
 ### `environment_vars`
 
 This section can be used to set environment variables for those unable to modify the environment of the container (ie. within HassOS)
@@ -41,7 +55,7 @@ environment_vars:
 
 ### `database`
 
-Event and recording information is managed in a sqlite database at `/config/frigate.db`. If that database is deleted, recordings will be orphaned and will need to be cleaned up manually. They also won't show up in the Media Browser within Home Assistant.
+Tracked object and recording information is managed in a sqlite database at `/config/frigate.db`. If that database is deleted, recordings will be orphaned and will need to be cleaned up manually. They also won't show up in the Media Browser within Home Assistant.
 
 If you are storing your database on a network share (SMB, NFS, etc), you may get a `database is locked` error message on startup. You can customize the location of the database in the config if necessary.
 
@@ -80,6 +94,14 @@ model:
   input_pixel_format: "bgr"
 ```
 
+#### `labelmap`
+
+:::warning
+
+If the labelmap is customized then the labels used for alerts will need to be adjusted as well. See [alert labels](../configuration/review.md#restricting-alerts-to-specific-labels) for more info.
+
+:::
+
 The labelmap can be customized to your needs. A common reason to do this is to combine multiple object types that are easily confused when you don't need to be as granular such as car/truck. By default, truck is renamed to car because they are often confused. You cannot add new object types, but you can change the names of existing objects in the model.
 
 ```yaml
@@ -96,7 +118,7 @@ model:
 
 Note that if you rename objects in the labelmap, you will also need to update your `objects -> track` list as well.
 
-:::caution
+:::warning
 
 Some labels have special handling and modifications can disable functionality.
 
@@ -106,45 +128,89 @@ Some labels have special handling and modifications can disable functionality.
 
 :::
 
-## Custom ffmpeg build
+## Network Configuration
 
-Included with Frigate is a build of ffmpeg that works for the vast majority of users. However, there exists some hardware setups which have incompatibilities with the included build. In this case, a docker volume mapping can be used to overwrite the included ffmpeg build with an ffmpeg build that works for your specific hardware setup.
+Changes to Frigate's internal network configuration can be made by bind mounting nginx.conf into the container. For example:
+
+```yaml
+services:
+  frigate:
+    container_name: frigate
+    ...
+    volumes:
+      ...
+      - /path/to/your/nginx.conf:/usr/local/nginx/conf/nginx.conf
+```
+
+### Enabling IPv6
+
+IPv6 is disabled by default, to enable IPv6 listen.gotmpl needs to be bind mounted with IPv6 enabled. For example:
+
+```
+{{ if not .enabled }}
+# intended for external traffic, protected by auth
+listen 8971;
+{{ else }}
+# intended for external traffic, protected by auth
+listen 8971 ssl;
+
+# intended for internal traffic, not protected by auth
+listen 5000;
+```
+
+becomes
+
+```
+{{ if not .enabled }}
+# intended for external traffic, protected by auth
+listen [::]:8971 ipv6only=off;
+{{ else }}
+# intended for external traffic, protected by auth
+listen [::]:8971 ipv6only=off ssl;
+
+# intended for internal traffic, not protected by auth
+listen [::]:5000 ipv6only=off;
+```
+
+## Custom Dependencies
+
+### Custom ffmpeg build
+
+Included with Frigate is a build of ffmpeg that works for the vast majority of users. However, there exists some hardware setups which have incompatibilities with the included build. In this case, statically built `ffmpeg` and `ffprobe` binaries can be placed in `/config/custom-ffmpeg/bin` for Frigate to use.
 
 To do this:
 
-1. Download your ffmpeg build and uncompress to a folder on the host (let's use `/home/appdata/frigate/custom-ffmpeg` for this example).
-2. Update your docker-compose or docker CLI to include `'/home/appdata/frigate/custom-ffmpeg':'/usr/lib/btbn-ffmpeg':'ro'` in the volume mappings.
-3. Restart Frigate and the custom version will be used if the mapping was done correctly.
+1. Download your ffmpeg build and uncompress it to the `/config/custom-ffmpeg` folder. Verify that both the `ffmpeg` and `ffprobe` binaries are located in `/config/custom-ffmpeg/bin`.
+2. Update the `ffmpeg.path` in your Frigate config to `/config/custom-ffmpeg`.
+3. Restart Frigate and the custom version will be used if the steps above were done correctly.
 
-NOTE: The folder that is mapped from the host needs to be the folder that contains `/bin`. So if the full structure is `/home/appdata/frigate/custom-ffmpeg/bin/ffmpeg` then `/home/appdata/frigate/custom-ffmpeg` needs to be mapped to `/usr/lib/btbn-ffmpeg`.
+### Custom go2rtc version
 
-## Custom go2rtc version
-
-Frigate currently includes go2rtc v1.8.4, there may be certain cases where you want to run a different version of go2rtc.
+Frigate currently includes go2rtc v1.9.2, there may be certain cases where you want to run a different version of go2rtc.
 
 To do this:
 
-1. Download the go2rtc build to the /config folder.
+1. Download the go2rtc build to the `/config` folder.
 2. Rename the build to `go2rtc`.
 3. Give `go2rtc` execute permission.
 4. Restart Frigate and the custom version will be used, you can verify by checking go2rtc logs.
 
-## Validating your config.yaml file updates
+## Validating your config.yml file updates
 
 When frigate starts up, it checks whether your config file is valid, and if it is not, the process exits. To minimize interruptions when updating your config, you have three options -- you can edit the config via the WebUI which has built in validation, use the config API, or you can validate on the command line using the frigate docker container.
 
 ### Via API
 
-Frigate can accept a new configuration file as JSON at the `/config/save` endpoint. When updating the config this way, Frigate will validate the config before saving it, and return a `400` if the config is not valid.
+Frigate can accept a new configuration file as JSON at the `/api/config/save` endpoint. When updating the config this way, Frigate will validate the config before saving it, and return a `400` if the config is not valid.
 
 ```bash
-curl -X POST http://frigate_host:5000/config/save -d @config.json
+curl -X POST http://frigate_host:5000/api/config/save -d @config.json
 ```
 
 if you'd like you can use your yaml config directly by using [`yq`](https://github.com/mikefarah/yq) to convert it to json:
 
 ```bash
-yq r -j config.yml | curl -X POST http://frigate_host:5000/config/save -d @-
+yq r -j config.yml | curl -X POST http://frigate_host:5000/api/config/save -d @-
 ```
 
 ### Via Command Line
@@ -157,5 +223,5 @@ docker run                                \
   --entrypoint python3                    \
   ghcr.io/blakeblackshear/frigate:stable  \
   -u -m frigate                           \
-  --validate_config
+  --validate-config
 ```

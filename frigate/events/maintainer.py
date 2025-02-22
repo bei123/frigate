@@ -1,23 +1,16 @@
-import datetime
 import logging
-import queue
 import threading
-from enum import Enum
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Dict
 
-from frigate.config import EventsConfig, FrigateConfig
+from frigate.comms.events_updater import EventEndPublisher, EventUpdateSubscriber
+from frigate.config import FrigateConfig
+from frigate.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event
-from frigate.types import CameraMetricsTypes
 from frigate.util.builtin import to_relative_box
 
 logger = logging.getLogger(__name__)
-
-
-class EventTypeEnum(str, Enum):
-    api = "api"
-    tracked_object = "tracked_object"
 
 
 def should_update_db(prev_event: Event, current_event: Event) -> bool:
@@ -30,8 +23,11 @@ def should_update_db(prev_event: Event, current_event: Event) -> bool:
         if (
             prev_event["top_score"] != current_event["top_score"]
             or prev_event["entered_zones"] != current_event["entered_zones"]
-            or prev_event["thumbnail"] != current_event["thumbnail"]
             or prev_event["end_time"] != current_event["end_time"]
+            or prev_event["average_estimated_speed"]
+            != current_event["average_estimated_speed"]
+            or prev_event["velocity_angle"] != current_event["velocity_angle"]
+            or prev_event["path_data"] != current_event["path_data"]
         ):
             return True
     return False
@@ -45,6 +41,12 @@ def should_update_state(prev_event: Event, current_event: Event) -> bool:
     if prev_event["attributes"] != current_event["attributes"]:
         return True
 
+    if prev_event["sub_label"] != current_event["sub_label"]:
+        return True
+
+    if len(prev_event["current_zones"]) < len(current_event["current_zones"]):
+        return True
+
     return False
 
 
@@ -52,21 +54,17 @@ class EventProcessor(threading.Thread):
     def __init__(
         self,
         config: FrigateConfig,
-        camera_processes: dict[str, CameraMetricsTypes],
-        event_queue: Queue,
-        event_processed_queue: Queue,
         timeline_queue: Queue,
         stop_event: MpEvent,
     ):
-        threading.Thread.__init__(self)
-        self.name = "event_processor"
+        super().__init__(name="event_processor")
         self.config = config
-        self.camera_processes = camera_processes
-        self.event_queue = event_queue
-        self.event_processed_queue = event_processed_queue
         self.timeline_queue = timeline_queue
         self.events_in_process: Dict[str, Event] = {}
         self.stop_event = stop_event
+
+        self.event_receiver = EventUpdateSubscriber()
+        self.event_end_publisher = EventEndPublisher()
 
     def run(self) -> None:
         # set an end_time on events without an end_time on startup
@@ -75,40 +73,53 @@ class EventProcessor(threading.Thread):
         ).execute()
 
         while not self.stop_event.is_set():
-            try:
-                source_type, event_type, camera, event_data = self.event_queue.get(
-                    timeout=1
-                )
-            except queue.Empty:
+            update = self.event_receiver.check_for_update()
+
+            if update == None:
                 continue
+
+            source_type, event_type, camera, _, event_data = update
 
             logger.debug(
                 f"Event received: {source_type} {event_type} {camera} {event_data['id']}"
             )
 
             if source_type == EventTypeEnum.tracked_object:
+                id = event_data["id"]
                 self.timeline_queue.put(
                     (
                         camera,
                         source_type,
                         event_type,
-                        self.events_in_process.get(event_data["id"]),
+                        self.events_in_process.get(id),
                         event_data,
                     )
                 )
 
-                if event_type == "start":
-                    self.events_in_process[event_data["id"]] = event_data
+                # if this is the first message, just store it and continue, its not time to insert it in the db
+                if (
+                    event_type == EventStateEnum.start
+                    or id not in self.events_in_process
+                ):
+                    self.events_in_process[id] = event_data
                     continue
 
                 self.handle_object_detection(event_type, camera, event_data)
             elif source_type == EventTypeEnum.api:
+                self.timeline_queue.put(
+                    (
+                        camera,
+                        source_type,
+                        event_type,
+                        {},
+                        event_data,
+                    )
+                )
+
                 self.handle_external_detection(event_type, event_data)
 
-        # set an end_time on events without an end_time before exiting
-        Event.update(end_time=datetime.datetime.now().timestamp()).where(
-            Event.end_time == None
-        ).execute()
+        self.event_receiver.stop()
+        self.event_end_publisher.stop()
         logger.info("Exiting event processor...")
 
     def handle_object_detection(
@@ -120,20 +131,16 @@ class EventProcessor(threading.Thread):
         """handle tracked object event updates."""
         updated_db = False
 
-        # if this is the first message, just store it and continue, its not time to insert it in the db
         if should_update_db(self.events_in_process[event_data["id"]], event_data):
             updated_db = True
             camera_config = self.config.cameras[camera]
-            event_config: EventsConfig = camera_config.record.events
             width = camera_config.detect.width
             height = camera_config.detect.height
             first_detector = list(self.config.detectors.values())[0]
 
-            start_time = event_data["start_time"] - event_config.pre_capture
+            start_time = event_data["start_time"]
             end_time = (
-                None
-                if event_data["end_time"] is None
-                else event_data["end_time"] + event_config.post_capture
+                None if event_data["end_time"] is None else event_data["end_time"]
             )
             # score of the snapshot
             score = (
@@ -162,11 +169,11 @@ class EventProcessor(threading.Thread):
                 )
             )
 
-            attributes = [
-                (
-                    None
-                    if event_data["snapshot"] is None
-                    else {
+            attributes = (
+                None
+                if event_data["snapshot"] is None
+                else [
+                    {
                         "box": to_relative_box(
                             width,
                             height,
@@ -175,12 +182,12 @@ class EventProcessor(threading.Thread):
                         "label": a["label"],
                         "score": a["score"],
                     }
-                )
-                for a in event_data["snapshot"]["attributes"]
-            ]
+                    for a in event_data["snapshot"]["attributes"]
+                ]
+            )
 
             # keep these from being set back to false because the event
-            # may have started while recordings and snapshots were enabled
+            # may have started while recordings/snapshots/alerts/detections were enabled
             # this would be an issue for long running events
             if self.events_in_process[event_data["id"]]["has_clip"]:
                 event_data["has_clip"] = True
@@ -194,7 +201,7 @@ class EventProcessor(threading.Thread):
                 Event.start_time: start_time,
                 Event.end_time: end_time,
                 Event.zones: list(event_data["entered_zones"]),
-                Event.thumbnail: event_data["thumbnail"],
+                Event.thumbnail: event_data.get("thumbnail"),
                 Event.has_clip: event_data["has_clip"],
                 Event.has_snapshot: event_data["has_snapshot"],
                 Event.model_hash: first_detector.model.model_hash,
@@ -206,7 +213,11 @@ class EventProcessor(threading.Thread):
                     "score": score,
                     "top_score": event_data["top_score"],
                     "attributes": attributes,
+                    "average_estimated_speed": event_data["average_estimated_speed"],
+                    "velocity_angle": event_data["velocity_angle"],
                     "type": "object",
+                    "max_severity": event_data.get("max_severity"),
+                    "path_data": event_data.get("path_data"),
                 },
             }
 
@@ -231,12 +242,14 @@ class EventProcessor(threading.Thread):
             # update the stored copy for comparison on future update messages
             self.events_in_process[event_data["id"]] = event_data
 
-        if event_type == "end":
+        if event_type == EventStateEnum.end:
             del self.events_in_process[event_data["id"]]
-            self.event_processed_queue.put((event_data["id"], camera))
+            self.event_end_publisher.publish((event_data["id"], camera, updated_db))
 
-    def handle_external_detection(self, event_type: str, event_data: Event) -> None:
-        if event_type == "new":
+    def handle_external_detection(
+        self, event_type: EventStateEnum, event_data: Event
+    ) -> None:
+        if event_type == EventStateEnum.start:
             event = {
                 Event.id: event_data["id"],
                 Event.label: event_data["label"],
@@ -244,7 +257,7 @@ class EventProcessor(threading.Thread):
                 Event.camera: event_data["camera"],
                 Event.start_time: event_data["start_time"],
                 Event.end_time: event_data["end_time"],
-                Event.thumbnail: event_data["thumbnail"],
+                Event.thumbnail: event_data.get("thumbnail"),
                 Event.has_clip: event_data["has_clip"],
                 Event.has_snapshot: event_data["has_snapshot"],
                 Event.zones: [],
@@ -255,7 +268,7 @@ class EventProcessor(threading.Thread):
                 },
             }
             Event.insert(event).execute()
-        elif event_type == "end":
+        elif event_type == EventStateEnum.end:
             event = {
                 Event.id: event_data["id"],
                 Event.end_time: event_data["end_time"],

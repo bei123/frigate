@@ -16,8 +16,8 @@ function migrate_db_path() {
     if [[ -f "${config_file_yaml}" ]]; then
         config_file="${config_file_yaml}"
     elif [[ ! -f "${config_file}" ]]; then
-        echo "[ERROR] Frigate config file not found"
-        return 1
+        # Frigate will create the config file on startup
+        return 0
     fi
     unset config_file_yaml
 
@@ -42,10 +42,16 @@ function migrate_db_path() {
     fi
 }
 
+function set_libva_version() {
+    local ffmpeg_path
+    ffmpeg_path=$(python3 /usr/local/ffmpeg/get_ffmpeg_path.py)
+    LIBAVFORMAT_VERSION_MAJOR=$("$ffmpeg_path" -version | grep -Po "libavformat\W+\K\d+")
+    export LIBAVFORMAT_VERSION_MAJOR
+}
+
 echo "[INFO] Preparing Frigate..."
 migrate_db_path
-export LIBAVFORMAT_VERSION_MAJOR=$(ffmpeg -version | grep -Po 'libavformat\W+\K\d+')
-
+set_libva_version
 echo "[INFO] Starting Frigate..."
 
 cd /opt/frigate || echo "[ERROR] Failed to change working directory to /opt/frigate"
