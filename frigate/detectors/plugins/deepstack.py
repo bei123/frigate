@@ -32,6 +32,7 @@ class DeepStack(DetectionApi):
         self.api_timeout = detector_config.api_timeout
         self.api_key = detector_config.api_key
         self.labels = detector_config.model.merged_labelmap
+        self.session = requests.Session()
 
     def get_label_index(self, label_value):
         if label_value.lower() == "truck":
@@ -49,12 +50,18 @@ class DeepStack(DetectionApi):
             image.save(output, format="JPEG")
             image_bytes = output.getvalue()
         data = {"api_key": self.api_key}
-        response = requests.post(
-            self.api_url,
-            data=data,
-            files={"image": image_bytes},
-            timeout=self.api_timeout,
-        )
+
+        try:
+            response = self.session.post(
+                self.api_url,
+                data=data,
+                files={"image": image_bytes},
+                timeout=self.api_timeout,
+            )
+        except requests.exceptions.RequestException as ex:
+            logger.error("Error calling deepstack API: %s", ex)
+            return np.zeros((20, 6), np.float32)
+
         response_json = response.json()
         detections = np.zeros((20, 6), np.float32)
         if response_json.get("predictions") is None:
