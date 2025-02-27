@@ -2,8 +2,11 @@
 
 import datetime
 import logging
+import subprocess as sp
+import threading
 from abc import ABC, abstractmethod
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker as _mprt
+from multiprocessing import shared_memory as _mpshm
 from string import printable
 from typing import AnyStr, Optional
 
@@ -33,6 +36,72 @@ def transliterate_to_latin(text: str) -> str:
         'fregate'
     """
     return unidecode(text)
+
+
+def on_edge(box, frame_shape):
+    if (
+        box[0] == 0
+        or box[1] == 0
+        or box[2] == frame_shape[1] - 1
+        or box[3] == frame_shape[0] - 1
+    ):
+        return True
+
+
+def has_better_attr(current_thumb, new_obj, attr_label) -> bool:
+    max_new_attr = max(
+        [0]
+        + [area(a["box"]) for a in new_obj["attributes"] if a["label"] == attr_label]
+    )
+    max_current_attr = max(
+        [0]
+        + [
+            area(a["box"])
+            for a in current_thumb["attributes"]
+            if a["label"] == attr_label
+        ]
+    )
+
+    # if the thumb has a higher scoring attr
+    return max_new_attr > max_current_attr
+
+
+def is_better_thumbnail(label, current_thumb, new_obj, frame_shape) -> bool:
+    # larger is better
+    # cutoff images are less ideal, but they should also be smaller?
+    # better scores are obviously better too
+
+    # check face on person
+    if label == "person":
+        if has_better_attr(current_thumb, new_obj, "face"):
+            return True
+        # if the current thumb has a face attr, dont update unless it gets better
+        if any([a["label"] == "face" for a in current_thumb["attributes"]]):
+            return False
+
+    # check license_plate on car
+    if label == "car":
+        if has_better_attr(current_thumb, new_obj, "license_plate"):
+            return True
+        # if the current thumb has a license_plate attr, dont update unless it gets better
+        if any([a["label"] == "license_plate" for a in current_thumb["attributes"]]):
+            return False
+
+    # if the new_thumb is on an edge, and the current thumb is not
+    if on_edge(new_obj["box"], frame_shape) and not on_edge(
+        current_thumb["box"], frame_shape
+    ):
+        return False
+
+    # if the score is better by more than 5%
+    if new_obj["score"] > current_thumb["score"] + 0.05:
+        return True
+
+    # if the area is 10% larger
+    if new_obj["area"] > current_thumb["area"] * 1.1:
+        return True
+
+    return False
 
 
 def draw_timestamp(
@@ -150,19 +219,35 @@ def draw_box_with_label(
     text_width = size[0][0]
     text_height = size[0][1]
     line_height = text_height + size[1]
+    # get frame height
+    frame_height = frame.shape[0]
     # set the text start position
     if position == "ul":
         text_offset_x = x_min
-        text_offset_y = 0 if y_min < line_height else y_min - (line_height + 8)
+        text_offset_y = max(0, y_min - (line_height + 8))
     elif position == "ur":
-        text_offset_x = x_max - (text_width + 8)
-        text_offset_y = 0 if y_min < line_height else y_min - (line_height + 8)
+        text_offset_x = max(0, x_max - (text_width + 8))
+        text_offset_y = max(0, y_min - (line_height + 8))
     elif position == "bl":
         text_offset_x = x_min
-        text_offset_y = y_max
+        text_offset_y = min(frame_height - line_height, y_max)
     elif position == "br":
-        text_offset_x = x_max - (text_width + 8)
-        text_offset_y = y_max
+        text_offset_x = max(0, x_max - (text_width + 8))
+        text_offset_y = min(frame_height - line_height, y_max)
+    # Adjust position if it overlaps with the box or goes out of frame
+    if position in {"ul", "ur"}:
+        if text_offset_y < y_min + thickness:  # Label overlaps with the box
+            if y_min - (line_height + 8) < 0 and y_max + line_height <= frame_height:
+                # Not enough space above, and there is space below
+                text_offset_y = y_max
+            elif y_min - (line_height + 8) >= 0:
+                # Enough space above, keep the label at the top
+                text_offset_y = max(0, y_min - (line_height + 8))
+    elif position in {"bl", "br"}:
+        if text_offset_y + line_height > frame_height:
+            # If there's not enough space below, try above the box
+            text_offset_y = max(0, y_min - (line_height + 8))
+
     # make the coords of the box with a small padding of two pixels
     textbox_coords = (
         (text_offset_x, text_offset_y),
@@ -209,6 +294,54 @@ def calculate_region(frame_shape, xmin, ymin, xmax, ymax, model_size, multiplier
         y_offset = max(0, (frame_shape[0] - size))
 
     return (x_offset, y_offset, x_offset + size, y_offset + size)
+
+
+def calculate_16_9_crop(frame_shape, xmin, ymin, xmax, ymax, multiplier=1.25):
+    min_size = 200
+
+    # size is the longest edge and divisible by 4
+    x_size = int((xmax - xmin) * multiplier)
+
+    if x_size < min_size:
+        x_size = min_size
+
+    y_size = int((ymax - ymin) * multiplier)
+
+    if y_size < min_size:
+        y_size = min_size
+
+    if frame_shape[1] / frame_shape[0] > 16 / 9 and x_size / y_size > 4:
+        return None
+
+    # calculate 16x9 using height
+    aspect_y_size = int(9 / 16 * x_size)
+
+    # if 16:9 by height is too small
+    if aspect_y_size < y_size or aspect_y_size > frame_shape[0]:
+        x_size = int((16 / 9) * y_size) // 4 * 4
+
+        if x_size / y_size > 1.8:
+            return None
+    else:
+        y_size = aspect_y_size // 4 * 4
+
+    # x_offset is midpoint of bounding box minus half the size
+    x_offset = int((xmax - xmin) / 2.0 + xmin - x_size / 2.0)
+    # if outside the image
+    if x_offset < 0:
+        x_offset = 0
+    elif x_offset > (frame_shape[1] - x_size):
+        x_offset = max(0, (frame_shape[1] - x_size))
+
+    # y_offset is midpoint of bounding box minus half the size
+    y_offset = int((ymax - ymin) / 2.0 + ymin - y_size / 2.0)
+    # # if outside the image
+    if y_offset < 0:
+        y_offset = 0
+    elif y_offset > (frame_shape[0] - y_size):
+        y_offset = max(0, (frame_shape[0] - y_size))
+
+    return (x_offset, y_offset, x_offset + x_size, y_offset + y_size)
 
 
 def get_yuv_crop(frame_shape, crop):
@@ -347,7 +480,7 @@ def yuv_to_3_channel_yuv(yuv_frame):
     # flatten the image into array
     yuv_data = yuv_frame.ravel()
 
-    # create a numpy array to hold all the 3 chanel yuv data
+    # create a numpy array to hold all the 3 channel yuv data
     all_yuv_data = np.empty((height, width, 3), dtype=np.uint8)
 
     y_count = height * width
@@ -387,6 +520,7 @@ def copy_yuv_to_position(
     destination_shape,
     source_frame=None,
     source_channel_dim=None,
+    interpolation=cv2.INTER_LINEAR,
 ):
     # get the coordinates of the channels for this position in the layout
     y, u1, u2, v1, v2 = get_yuv_crop(
@@ -435,7 +569,6 @@ def copy_yuv_to_position(
         uv_y_offset = y_y_offset // 4
         uv_x_offset = y_x_offset // 2
 
-        interpolation = cv2.INTER_LINEAR
         # resize/copy y channel
         destination_frame[
             y[1] + y_y_offset : y[1] + y_y_offset + y_resize_height,
@@ -575,7 +708,7 @@ def intersection_over_union(box_a, box_b):
 
     # compute the intersection over union by taking the intersection
     # area and dividing it by the sum of prediction + ground-truth
-    # areas - the interesection area
+    # areas - the intersection area
     iou = inter_area / float(box_a_area + box_b_area - inter_area)
 
     # return the intersection over union value
@@ -600,69 +733,145 @@ def clipped(obj, frame_shape):
 
 class FrameManager(ABC):
     @abstractmethod
-    def create(self, name, size) -> AnyStr:
+    def create(self, name: str, size: int) -> AnyStr:
         pass
 
     @abstractmethod
-    def get(self, name, timeout_ms=0):
+    def write(self, name: str) -> memoryview:
         pass
 
     @abstractmethod
-    def close(self, name):
+    def get(self, name: str, timeout_ms: int = 0):
         pass
 
     @abstractmethod
-    def delete(self, name):
+    def close(self, name: str):
+        pass
+
+    @abstractmethod
+    def delete(self, name: str):
+        pass
+
+    @abstractmethod
+    def cleanup(self):
         pass
 
 
-class DictFrameManager(FrameManager):
-    def __init__(self):
-        self.frames = {}
+class UntrackedSharedMemory(_mpshm.SharedMemory):
+    # https://github.com/python/cpython/issues/82300#issuecomment-2169035092
 
-    def create(self, name, size) -> AnyStr:
-        mem = bytearray(size)
-        self.frames[name] = mem
-        return mem
+    __lock = threading.Lock()
 
-    def get(self, name, shape):
-        mem = self.frames[name]
-        return np.ndarray(shape, dtype=np.uint8, buffer=mem)
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        create: bool = False,
+        size: int = 0,
+        *,
+        track: bool = False,
+    ) -> None:
+        self._track = track
 
-    def close(self, name):
-        pass
+        # if tracking, normal init will suffice
+        if track:
+            return super().__init__(name=name, create=create, size=size)
 
-    def delete(self, name):
-        del self.frames[name]
+        # lock so that other threads don't attempt to use the
+        # register function during this time
+        with self.__lock:
+            # temporarily disable registration during initialization
+            orig_register = _mprt.register
+            _mprt.register = self.__tmp_register
+
+            # initialize; ensure original register function is
+            # re-instated
+            try:
+                super().__init__(name=name, create=create, size=size)
+            finally:
+                _mprt.register = orig_register
+
+    @staticmethod
+    def __tmp_register(*args, **kwargs) -> None:
+        return
+
+    def unlink(self) -> None:
+        if _mpshm._USE_POSIX and self._name:
+            _mpshm._posixshmem.shm_unlink(self._name)
+            if self._track:
+                _mprt.unregister(self._name, "shared_memory")
 
 
 class SharedMemoryFrameManager(FrameManager):
     def __init__(self):
-        self.shm_store = {}
+        self.shm_store: dict[str, UntrackedSharedMemory] = {}
 
-    def create(self, name, size) -> AnyStr:
-        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    def create(self, name: str, size) -> AnyStr:
+        try:
+            shm = UntrackedSharedMemory(
+                name=name,
+                create=True,
+                size=size,
+            )
+        except FileExistsError:
+            shm = UntrackedSharedMemory(name=name)
+
         self.shm_store[name] = shm
         return shm.buf
 
-    def get(self, name, shape):
+    def write(self, name: str) -> memoryview:
+        try:
+            if name in self.shm_store:
+                shm = self.shm_store[name]
+            else:
+                shm = UntrackedSharedMemory(name=name)
+                self.shm_store[name] = shm
+            return shm.buf
+        except FileNotFoundError:
+            logger.info(f"the file {name} not found")
+            return None
+
+    def get(self, name: str, shape) -> Optional[np.ndarray]:
+        try:
+            if name in self.shm_store:
+                shm = self.shm_store[name]
+            else:
+                shm = UntrackedSharedMemory(name=name)
+                self.shm_store[name] = shm
+            return np.ndarray(shape, dtype=np.uint8, buffer=shm.buf)
+        except FileNotFoundError:
+            return None
+
+    def close(self, name: str):
         if name in self.shm_store:
-            shm = self.shm_store[name]
+            self.shm_store[name].close()
+            del self.shm_store[name]
+
+    def delete(self, name: str):
+        if name in self.shm_store:
+            self.shm_store[name].close()
+
+            try:
+                self.shm_store[name].unlink()
+            except FileNotFoundError:
+                pass
+
+            del self.shm_store[name]
         else:
-            shm = shared_memory.SharedMemory(name=name)
-            self.shm_store[name] = shm
-        return np.ndarray(shape, dtype=np.uint8, buffer=shm.buf)
+            try:
+                shm = UntrackedSharedMemory(name=name)
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
 
-    def close(self, name):
-        if name in self.shm_store:
-            self.shm_store[name].close()
-            del self.shm_store[name]
+    def cleanup(self) -> None:
+        for shm in self.shm_store.values():
+            shm.close()
 
-    def delete(self, name):
-        if name in self.shm_store:
-            self.shm_store[name].close()
-            self.shm_store[name].unlink()
-            del self.shm_store[name]
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def create_mask(frame_shape, mask):
@@ -679,9 +888,74 @@ def create_mask(frame_shape, mask):
     return mask_img
 
 
-def add_mask(mask, mask_img):
+def add_mask(mask: str, mask_img: np.ndarray):
     points = mask.split(",")
+
+    # masks and zones are saved as relative coordinates
+    # we know if any points are > 1 then it is using the
+    # old native resolution coordinates
+    if any(x > "1.0" for x in points):
+        raise Exception("add mask expects relative coordinates only")
+
     contour = np.array(
-        [[int(points[i]), int(points[i + 1])] for i in range(0, len(points), 2)]
+        [
+            [
+                int(float(points[i]) * mask_img.shape[1]),
+                int(float(points[i + 1]) * mask_img.shape[0]),
+            ]
+            for i in range(0, len(points), 2)
+        ]
     )
     cv2.fillPoly(mask_img, pts=[contour], color=(0))
+
+
+def get_image_from_recording(
+    ffmpeg,  # Ffmpeg Config
+    file_path: str,
+    relative_frame_time: float,
+    codec: str,
+    height: Optional[int] = None,
+) -> Optional[any]:
+    """retrieve a frame from given time in recording file."""
+
+    ffmpeg_cmd = [
+        ffmpeg.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-ss",
+        f"00:00:{relative_frame_time}",
+        "-i",
+        file_path,
+        "-frames:v",
+        "1",
+        "-c:v",
+        codec,
+        "-f",
+        "image2pipe",
+        "-",
+    ]
+
+    if height is not None:
+        ffmpeg_cmd.insert(-3, "-vf")
+        ffmpeg_cmd.insert(-3, f"scale=-1:{height}")
+
+    process = sp.run(
+        ffmpeg_cmd,
+        capture_output=True,
+    )
+
+    if process.returncode == 0:
+        return process.stdout
+    else:
+        return None
+
+
+def get_histogram(image, x_min, y_min, x_max, y_max):
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_YUV2BGR_I420)
+    image_bgr = image_bgr[y_min:y_max, x_min:x_max]
+
+    hist = cv2.calcHist(
+        [image_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256]
+    )
+    return cv2.normalize(hist, hist).flatten()

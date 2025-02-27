@@ -5,6 +5,8 @@ import imutils
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+from frigate.camera import PTZMetrics
+from frigate.comms.config_updater import ConfigSubscriber
 from frigate.config import MotionConfig
 from frigate.motion import MotionDetector
 
@@ -17,9 +19,7 @@ class ImprovedMotionDetector(MotionDetector):
         frame_shape,
         config: MotionConfig,
         fps: int,
-        improve_contrast,
-        threshold,
-        contour_area,
+        ptz_metrics: PTZMetrics = None,
         name="improved",
         blur_radius=1,
         interpolation=cv2.INTER_NEAREST,
@@ -44,20 +44,44 @@ class ImprovedMotionDetector(MotionDetector):
         self.mask = np.where(resized_mask == [0])
         self.save_images = False
         self.calibrating = True
-        self.improve_contrast = improve_contrast
-        self.threshold = threshold
-        self.contour_area = contour_area
         self.blur_radius = blur_radius
         self.interpolation = interpolation
         self.contrast_values = np.zeros((contrast_frame_history, 2), np.uint8)
         self.contrast_values[:, 1:2] = 255
         self.contrast_values_index = 0
+        self.config_subscriber = ConfigSubscriber(f"config/motion/{name}", True)
+        self.ptz_metrics = ptz_metrics
+        self.last_stop_time = None
 
     def is_calibrating(self):
         return self.calibrating
 
     def detect(self, frame):
         motion_boxes = []
+
+        # check for updated motion config
+        _, updated_motion_config = self.config_subscriber.check_for_update()
+
+        if updated_motion_config:
+            self.config = updated_motion_config
+
+        if not self.config.enabled:
+            return motion_boxes
+
+        # if ptz motor is moving from autotracking, quickly return
+        # a single box that is 80% of the frame
+        if (
+            self.ptz_metrics.autotracker_enabled.value
+            and not self.ptz_metrics.motor_stopped.is_set()
+        ):
+            return [
+                (
+                    int(self.frame_shape[1] * 0.1),
+                    int(self.frame_shape[0] * 0.1),
+                    int(self.frame_shape[1] * 0.9),
+                    int(self.frame_shape[0] * 0.9),
+                )
+            ]
 
         gray = frame[0 : self.frame_shape[0], 0 : self.frame_shape[1]]
 
@@ -72,14 +96,17 @@ class ImprovedMotionDetector(MotionDetector):
             resized_saved = resized_frame.copy()
 
         # Improve contrast
-        if self.improve_contrast.value:
+        if self.config.improve_contrast:
             # TODO tracking moving average of min/max to avoid sudden contrast changes
-            minval = np.percentile(resized_frame, 4).astype(np.uint8)
-            maxval = np.percentile(resized_frame, 96).astype(np.uint8)
+            min_value = np.percentile(resized_frame, 4).astype(np.uint8)
+            max_value = np.percentile(resized_frame, 96).astype(np.uint8)
             # skip contrast calcs if the image is a single color
-            if minval < maxval:
+            if min_value < max_value:
                 # keep track of the last 50 contrast values
-                self.contrast_values[self.contrast_values_index] = [minval, maxval]
+                self.contrast_values[self.contrast_values_index] = [
+                    min_value,
+                    max_value,
+                ]
                 self.contrast_values_index += 1
                 if self.contrast_values_index == len(self.contrast_values):
                     self.contrast_values_index = 0
@@ -96,7 +123,8 @@ class ImprovedMotionDetector(MotionDetector):
 
         # mask frame
         # this has to come after contrast improvement
-        resized_frame[self.mask] = [255]
+        # Setting masked pixels to zero, to match the average frame at startup
+        resized_frame[self.mask] = [0]
 
         resized_frame = gaussian_filter(resized_frame, sigma=1, radius=self.blur_radius)
 
@@ -110,24 +138,24 @@ class ImprovedMotionDetector(MotionDetector):
 
         # compute the threshold image for the current frame
         thresh = cv2.threshold(
-            frameDelta, self.threshold.value, 255, cv2.THRESH_BINARY
+            frameDelta, self.config.threshold, 255, cv2.THRESH_BINARY
         )[1]
 
         # dilate the thresholded image to fill in holes, then find contours
         # on thresholded image
         thresh_dilated = cv2.dilate(thresh, None, iterations=1)
-        cnts = cv2.findContours(
+        contours = cv2.findContours(
             thresh_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        cnts = imutils.grab_contours(cnts)
+        contours = imutils.grab_contours(contours)
 
         # loop over the contours
         total_contour_area = 0
-        for c in cnts:
+        for c in contours:
             # if the contour is big enough, count it as motion
             contour_area = cv2.contourArea(c)
             total_contour_area += contour_area
-            if contour_area > self.contour_area.value:
+            if contour_area > self.config.contour_area:
                 x, y, w, h = cv2.boundingRect(c)
                 motion_boxes.append(
                     (
@@ -141,6 +169,25 @@ class ImprovedMotionDetector(MotionDetector):
         pct_motion = total_contour_area / (
             self.motion_frame_size[0] * self.motion_frame_size[1]
         )
+
+        # check if the motor has just stopped from autotracking
+        # if so, reassign the average to the current frame so we begin with a new baseline
+        if (
+            # ensure we only do this for cameras with autotracking enabled
+            self.ptz_metrics.autotracker_enabled.value
+            and self.ptz_metrics.motor_stopped.is_set()
+            and (
+                self.last_stop_time is None
+                or self.ptz_metrics.stop_time.value != self.last_stop_time
+            )
+            # value is 0 on startup or when motor is moving
+            and self.ptz_metrics.stop_time.value != 0
+        ):
+            self.last_stop_time = self.ptz_metrics.stop_time.value
+
+            self.avg_frame = resized_frame.astype(np.float32)
+            motion_boxes = []
+            pct_motion = 0
 
         # once the motion is less than 5% and the number of contours is < 4, assume its calibrated
         if pct_motion < 0.05 and len(motion_boxes) <= 4:
@@ -170,9 +217,11 @@ class ImprovedMotionDetector(MotionDetector):
             ]
             cv2.imwrite(
                 f"debug/frames/{self.name}-{self.frame_counter}.jpg",
-                cv2.hconcat(frames)
-                if self.frame_shape[0] > self.frame_shape[1]
-                else cv2.vconcat(frames),
+                (
+                    cv2.hconcat(frames)
+                    if self.frame_shape[0] > self.frame_shape[1]
+                    else cv2.vconcat(frames)
+                ),
             )
 
         if len(motion_boxes) > 0:
@@ -194,3 +243,7 @@ class ImprovedMotionDetector(MotionDetector):
             self.motion_frame_count = 0
 
         return motion_boxes
+
+    def stop(self) -> None:
+        """stop the motion detector."""
+        self.config_subscriber.stop()

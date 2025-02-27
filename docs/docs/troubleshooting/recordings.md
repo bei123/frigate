@@ -3,9 +3,17 @@ id: recordings
 title: Troubleshooting Recordings
 ---
 
-### WARNING : Unable to keep up with recording segments in cache for camera. Keeping the 5 most recent segments out of 6 and discarding the rest...
+## I have Frigate configured for motion recording only, but it still seems to be recording even with no motion. Why?
 
-This error can be caused by a number of different issues. The first step in troubleshooting is to enable debug logging for recording, this will enable logging showing how long it takes for recordings to be moved from RAM cache to the disk.
+You'll want to:
+
+- Make sure your camera's timestamp is masked out with a motion mask. Even if there is no motion occurring in your scene, your motion settings may be sensitive enough to count your timestamp as motion.
+- If you have audio detection enabled, keep in mind that audio that is heard above `min_volume` is considered motion.
+- [Tune your motion detection settings](/configuration/motion_detection) either by editing your config file or by using the UI's Motion Tuner.
+
+## I see the message: WARNING : Unable to keep up with recording segments in cache for camera. Keeping the 5 most recent segments out of 6 and discarding the rest...
+
+This error can be caused by a number of different issues. The first step in troubleshooting is to enable debug logging for recording. This will enable logging showing how long it takes for recordings to be moved from RAM cache to the disk.
 
 ```yaml
 logger:
@@ -24,6 +32,43 @@ It is important to let this run until the errors begin to happen, to confirm tha
 #### Copy Times > 1 second
 
 If the storage is too slow to keep up with the recordings then the maintainer will fall behind and purge the oldest recordings to ensure the cache does not fill up causing a crash. In this case it is important to diagnose why the copy times are slow.
+
+##### Check RAM, swap, cache utilization, and disk utilization
+
+If CPU, RAM, disk throughput, or bus I/O is insufficient, nothing inside frigate will help. It is important to review each aspect of available system resources.
+
+On linux, some helpful tools/commands in diagnosing would be:
+
+- docker stats
+- htop
+- iotop -o
+- iostat -sxy --human 1 1
+- vmstat 1
+
+On modern linux kernels, the system will utilize some swap if enabled. Setting vm.swappiness=1 no longer means that the kernel will only swap in order to avoid OOM. To prevent any swapping inside a container, set allocations memory and memory+swap to be the same and disable swapping by setting the following docker/podman run parameters:
+
+**Compose example**
+
+```yaml
+version: "3.9"
+services:
+  frigate:
+    ...
+    mem_swappiness: 0
+    memswap_limit: <MAXSWAP>
+    deploy:
+      resources:
+        limits:
+          memory: <MAXRAM>
+```
+
+**Run command example**
+
+```
+--memory=<MAXRAM> --memory-swap=<MAXSWAP> --memory-swappiness=0
+```
+
+NOTE: These are hard-limits for the container, be sure there is enough headroom above what is shown by `docker stats` for your container. It will immediately halt if it hits `<MAXRAM>`. In general, running all cache and tmp filespace in RAM is preferable to disk I/O where possible.
 
 ##### Check Storage Type
 

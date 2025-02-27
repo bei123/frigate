@@ -15,7 +15,7 @@ from ws4py.server.wsgirefserver import (
 from ws4py.server.wsgiutils import WebSocketWSGIApplication
 from ws4py.websocket import WebSocket as WebSocket_
 
-from frigate.comms.dispatcher import Communicator
+from frigate.comms.base_communicator import Communicator
 from frigate.config import FrigateConfig
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ class WebSocketClient(Communicator):  # type: ignore[misc]
 
     def __init__(self, config: FrigateConfig) -> None:
         self.config = config
+        self.websocket_server = None
 
     def subscribe(self, receiver: Callable) -> None:
         self._dispatcher = receiver
@@ -96,6 +97,10 @@ class WebSocketClient(Communicator):  # type: ignore[misc]
         except Exception:
             # if the payload can't be decoded don't relay to clients
             logger.debug(f"payload for {topic} wasn't text. Skipping...")
+            return
+
+        if self.websocket_server is None:
+            logger.debug("Skipping message, websocket not connected yet")
             return
 
         try:
